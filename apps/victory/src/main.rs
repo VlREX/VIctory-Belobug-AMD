@@ -3,6 +3,7 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+mod agility;
 mod census;
 mod inspect;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -262,6 +263,21 @@ fn show_config() -> Result<()> {
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
+    let dll = agility::runtime_dir().map(|d| d.join("D3D12Core.dll"));
+    match dll {
+        Some(dll) if cfg!(agility_runtime) && dll.exists() => println!(
+            "d3d12 sdk   : {} (version {})",
+            dll.display(),
+            agility::D3D12SDKVersion
+        ),
+        Some(dll) if cfg!(agility_runtime) => println!(
+            "d3d12 sdk   : named but missing ({}): device creation fails; run `cargo xtask agility`",
+            dll.display()
+        ),
+        _ => println!(
+            "d3d12 sdk   : not built in, the in-box runtime is used (needed on Windows 10: `cargo xtask agility`, then build again)"
+        ),
+    }
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }

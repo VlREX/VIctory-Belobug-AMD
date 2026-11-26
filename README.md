@@ -39,7 +39,7 @@ It started at 280 ms a frame in the same scenes three days earlier. What sets
 the frame now is the one thread that submits the title's work to the card
 (about 40 ms); the card itself needs about 36 ms and now waits about 7 ms a frame with nothing queued.
 
-### Renderer patches (off by default while they are tested)
+### Renderer patches (on in `scripts\play.ps1`, off in a plain run)
 
 | Switch | What it does |
 |---|---|
@@ -75,6 +75,12 @@ You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
 model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
 tools, and your own dump of the title.
 
+On Windows 10, run `cargo xtask agility` once before building. Windows 10's
+in-box D3D12 runtime stops at shader model 6.5 and refuses every translated
+pipeline; the command puts Microsoft's D3D12 Agility SDK runtime (a pinned NuGet
+package, its SHA-512 checked) in `target\<profile>\D3D12\`, where `victory.exe`
+and the shader tests load it. Windows 11 needs nothing.
+
 ```powershell
 git clone https://github.com/avatarmanz/VIctory-7900XTX
 cd VIctory-7900XTX
@@ -83,8 +89,11 @@ cargo build --locked --profile diag -p victory --features diagnostics
 scripts\play.ps1 -Exe <path of your copy's executable>
 ```
 
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+`scripts\play.ps1` turns the renderer patches below on and selects the Series S
+profile, as in the measurements above. `-Safe` leaves the patches out and selects
+Series X; try it first when something is wrong. `-Console series-x` keeps the
+patches with the other profile. `-RayTracing` turns the title's ray-traced
+indirect light on.
 
 For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
 `VICTORY_FIDELITYFX_DIR` to the folder containing AMD's signed
