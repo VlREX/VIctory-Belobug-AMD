@@ -1187,6 +1187,57 @@ mod tests {
         assert_eq!(dependency_levels(&empty, &[0, 1]), pairwise_levels(&empty, &[0, 1]));
     }
 
+    // Synthetic measurement only; no timing assertion.
+    #[test]
+    fn benchmark_dependency_levels() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        for copies in [0, 100, 400, 1400, 2800] {
+            for overlap in [false, true] {
+                let count = 2800usize;
+                let does: Vec<_> = (0..count).map(|i| {
+                    let src = if overlap { (i * 37 % 1024) * 16 } else { i * 1024 };
+                    let dst = if overlap { (i * 53 % 1024) * 16 + 8192 } else { src + 512 };
+                    if (i * 1499 % count) < copies {
+                        copy(dst, src, 128, true)
+                    } else {
+                        fill(src, 128, true)
+                    }
+                }).collect();
+                let order: Vec<_> = (0..count).collect();
+                assert_eq!(pairwise_levels(&does, &order), dependency_levels(&does, &order));
+                let measure = |new: bool| {
+                    let start = Instant::now();
+                    for _ in 0..5 {
+                        let got = if new {
+                            dependency_levels(black_box(&does), black_box(&order))
+                        } else {
+                            pairwise_levels(black_box(&does), black_box(&order))
+                        };
+                        drop(black_box(got));
+                    }
+                    start.elapsed().as_secs_f64() * 1e6 / 5.0
+                };
+                black_box(measure(false));
+                black_box(measure(true));
+                let (mut old, mut new) = (Vec::new(), Vec::new());
+                for i in 0..7 {
+                    let (a, b) = if i % 2 == 0 {
+                        (measure(false), measure(true))
+                    } else {
+                        let b = measure(true);
+                        (measure(false), b)
+                    };
+                    old.push(a);
+                    new.push(b);
+                }
+                old.sort_by(f64::total_cmp);
+                new.sort_by(f64::total_cmp);
+                eprintln!("CARD_LEVEL_BENCH steps={count} copies={copies} overlap={overlap}: old {:.3} us, new {:.3} us, {:.3}x", old[3], new[3], old[3] / new[3]);
+            }
+        }
+    }
+
     /// Whatever the steps, done level by level (in a level every read
     /// before every write) they read and leave what they read and leave one
     /// after the other, the CPU's steps ahead of all of them.
