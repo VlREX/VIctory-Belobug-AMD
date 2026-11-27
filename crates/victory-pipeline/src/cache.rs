@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
@@ -26,10 +28,44 @@ impl CacheKey {
     }
 }
 
+// Only in-flight misses live in this table. A cache hit never takes its lock.
+type Flights = Mutex<HashMap<CacheKey, Arc<Mutex<()>>>>;
+
+/// A permit for one key. The table owns one reference, and each caller
+/// owns another; the last caller retires the entry under the table lock.
+struct Flight<'a> {
+    key: CacheKey,
+    permit: Option<Arc<Mutex<()>>>,
+    flights: &'a Flights,
+}
+
+impl Flight<'_> {
+    fn permit(&self) -> &Mutex<()> {
+        self.permit.as_deref().expect("live flight has a permit")
+    }
+}
+
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        let mut flights = self.flights.lock().unwrap_or_else(|e| e.into_inner());
+        // Release the caller's reference before unlocking the registry.
+        // Otherwise two finishing callers can both see a count of three
+        // and leave the registry's sole reference behind indefinitely.
+        drop(self.permit.take());
+        if flights
+            .get(&self.key)
+            .is_some_and(|permit| Arc::strong_count(permit) == 1)
+        {
+            flights.remove(&self.key);
+        }
+    }
+}
+
 /// Content-addressed store under the user's cache directory.
 #[derive(Debug, Clone)]
 pub struct Cache {
     root: PathBuf,
+    flights: Arc<Flights>,
 }
 
 impl Cache {
@@ -38,7 +74,10 @@ impl Cache {
         let root = root.into();
         victory_core::ensure_outside_repo(&root)?;
         std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
-        Ok(Cache { root })
+        Ok(Cache {
+            root,
+            flights: Arc::default(),
+        })
     }
 
     pub fn path_for(&self, key: &CacheKey) -> PathBuf {
@@ -46,12 +85,36 @@ impl Cache {
         self.root.join(&hex[..2]).join(&hex[2..])
     }
 
+    fn flight(&self, key: CacheKey) -> Flight<'_> {
+        let mut flights = self.flights.lock().unwrap_or_else(|e| e.into_inner());
+        let permit = Arc::clone(flights.entry(key).or_default());
+        Flight {
+            key,
+            permit: Some(permit),
+            flights: &self.flights,
+        }
+    }
+
     /// Returns the cached output for `input`, converting it first if needed.
+    ///
+    /// Concurrent misses for the same key on this cache (including its
+    /// clones) share one successful conversion. Different keys may convert
+    /// concurrently. Independently opened caches and processes are not
+    /// coordinated here. A converter must not recursively request its own key.
     pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
         let key = CacheKey::new(converter, input);
         let path = self.path_for(&key);
         if path.is_file() {
             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
+            return Ok(path);
+        }
+        // Do not hold the table lock while waiting, converting or writing.
+        // Declare the flight first so the permit guard drops before the entry
+        // can be retired, also when conversion returns an error or unwinds.
+        let flight = self.flight(key);
+        let _permit = flight.permit().lock().unwrap_or_else(|e| e.into_inner());
+        if path.is_file() {
+            tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit after waiting");
             return Ok(path);
         }
         let output = converter
@@ -135,6 +198,128 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(std::fs::read(&a).unwrap(), b"ABC");
         assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn concurrent_misses_share_one_conversion_across_clones() {
+        use std::sync::Barrier;
+
+        struct SlowUpper(AtomicUsize);
+        impl Converter for SlowUpper {
+            fn id(&self) -> &'static str {
+                "test.slow-upper"
+            }
+            fn version(&self) -> u32 {
+                1
+            }
+            fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                Ok(input.to_ascii_uppercase())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = SlowUpper(AtomicUsize::new(0));
+        let start = Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let cache = cache.clone();
+                let conv = &conv;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    let path = cache.get_or_convert(conv, b"shared").unwrap();
+                    assert_eq!(std::fs::read(path).unwrap(), b"SHARED");
+                });
+            }
+        });
+        assert_eq!(conv.0.load(Ordering::Relaxed), 1);
+        assert!(cache.flights.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn different_keys_have_independent_permits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        let a = CacheKey::new(&conv, b"a");
+        let b = CacheKey::new(&conv, b"b");
+        {
+            let first = cache.flight(a);
+            let _held = first.permit().lock().unwrap();
+            let same = cache.flight(a);
+            let other = cache.flight(b);
+            assert!(same.permit().try_lock().is_err());
+            assert!(other.permit().try_lock().is_ok());
+        }
+        assert!(cache.flights.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_flight_retirement_does_not_retain_entries() {
+        use std::sync::Barrier;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        let keys: Vec<_> = (0u32..256)
+            .map(|n| CacheKey::new(&conv, &n.to_le_bytes()))
+            .collect();
+        let rendezvous = Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let cache = &cache;
+                let keys = &keys;
+                let rendezvous = &rendezvous;
+                scope.spawn(move || {
+                    for &key in keys {
+                        let flight = cache.flight(key);
+                        // All eight callers own a reference before any retire.
+                        rendezvous.wait();
+                        drop(flight);
+                        rendezvous.wait();
+                    }
+                });
+            }
+        });
+        assert!(cache.flights.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_conversion_retires_permit_and_can_retry() {
+        struct FailOnce(AtomicUsize);
+        impl Converter for FailOnce {
+            fn id(&self) -> &'static str {
+                "test.fail-once"
+            }
+            fn version(&self) -> u32 {
+                1
+            }
+            fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+                if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                    anyhow::bail!("temporary conversion failure");
+                }
+                Ok(input.to_vec())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = FailOnce(AtomicUsize::new(0));
+        assert!(cache.get_or_convert(&conv, b"retry").is_err());
+        assert!(cache.flights.lock().unwrap().is_empty());
+        let path = cache.get_or_convert(&conv, b"retry").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"retry");
+        assert_eq!(conv.0.load(Ordering::Relaxed), 2);
+        assert!(cache.flights.lock().unwrap().is_empty());
     }
 
     #[test]
