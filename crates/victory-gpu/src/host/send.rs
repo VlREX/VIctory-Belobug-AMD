@@ -421,4 +421,71 @@ mod tests {
         }
         assert_eq!(new_work, old_work);
     }
+
+    // Validation branch only: timings never gate correctness or CI.
+    #[test]
+    fn benchmark_upload_planners() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        fn time(cases: &[Vec<(usize, usize)>], new: bool) -> Duration {
+            let began = Instant::now();
+            for _ in 0..16 {
+                let mut at = 0;
+                let mut work = Vec::new();
+                let mut copies = Vec::with_capacity(cases.len());
+                for (i, ranges) in black_box(cases).iter().enumerate() {
+                    let copy = if new {
+                        plan_copy(i, ranges, &mut at, &mut work)
+                    } else {
+                        reference(i, ranges, &mut at, &mut work)
+                    };
+                    copies.push(copy);
+                }
+                drop(black_box((copies, work, at)));
+            }
+            began.elapsed()
+        }
+
+        for (name, mode) in [("short-heavy", 0), ("mixed", 1), ("long-heavy", 2)] {
+            let cases: Vec<Vec<_>> = (0..20)
+                .map(|_| (0..4000).map(|i| {
+                    let a = i * 512;
+                    match (mode, i % 8) {
+                        (0, 0) | (1, 0..=3) | (2, 0..=6) => (a, a + 260),
+                        (_, 7) => (a + 1, a + 4),
+                        _ => (a, a + 4 * (1 + i % 16)),
+                    }
+                }).collect())
+                .collect();
+            let (mut old_at, mut new_at) = (0, 0);
+            let (mut old_work, mut new_work) = (Vec::new(), Vec::new());
+            for (i, ranges) in cases.iter().enumerate() {
+                let old = reference(i, ranges, &mut old_at, &mut old_work);
+                let new = plan_copy(i, ranges, &mut new_at, &mut new_work);
+                assert_eq!(old.runs, new.runs);
+                assert_eq!(old.pairs, new.pairs);
+            }
+            assert_eq!(old_at, new_at);
+            assert_eq!(old_work, new_work);
+            black_box(time(&cases, false));
+            black_box(time(&cases, true));
+            let (mut old, mut new) = (Vec::new(), Vec::new());
+            for i in 0..9 {
+                let (a, b) = if i % 2 == 0 {
+                    (time(&cases, false), time(&cases, true))
+                } else {
+                    let b = time(&cases, true);
+                    (time(&cases, false), b)
+                };
+                old.push(a.as_secs_f64() * 1e6 / 16.0);
+                new.push(b.as_secs_f64() * 1e6 / 16.0);
+            }
+            old.sort_by(f64::total_cmp);
+            new.sort_by(f64::total_cmp);
+            eprintln!("UPLOAD_PLAN_BENCH {name}: 80000 ranges, old median {:.3} us, new median {:.3} us, old/new {:.3}x; profile={}",
+                old[4], new[4], old[4] / new[4],
+                if cfg!(debug_assertions) { "debug" } else { "release-like" });
+        }
+    }
 }
