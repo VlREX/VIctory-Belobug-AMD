@@ -35,14 +35,27 @@ type Flights = Mutex<HashMap<CacheKey, Arc<Mutex<()>>>>;
 /// owns another; the last caller retires the entry under the table lock.
 struct Flight<'a> {
     key: CacheKey,
-    permit: Arc<Mutex<()>>,
+    permit: Option<Arc<Mutex<()>>>,
     flights: &'a Flights,
+}
+
+impl Flight<'_> {
+    fn permit(&self) -> &Mutex<()> {
+        self.permit.as_deref().expect("live flight has a permit")
+    }
 }
 
 impl Drop for Flight<'_> {
     fn drop(&mut self) {
         let mut flights = self.flights.lock().unwrap_or_else(|e| e.into_inner());
-        if Arc::strong_count(&self.permit) == 2 {
+        // Release the caller's reference before unlocking the registry.
+        // Otherwise two finishing callers can both see a count of three
+        // and leave the registry's sole reference behind indefinitely.
+        drop(self.permit.take());
+        if flights
+            .get(&self.key)
+            .is_some_and(|permit| Arc::strong_count(permit) == 1)
+        {
             flights.remove(&self.key);
         }
     }
@@ -77,7 +90,7 @@ impl Cache {
         let permit = Arc::clone(flights.entry(key).or_default());
         Flight {
             key,
-            permit,
+            permit: Some(permit),
             flights: &self.flights,
         }
     }
@@ -99,7 +112,7 @@ impl Cache {
         // Declare the flight first so the permit guard drops before the entry
         // can be retired, also when conversion returns an error or unwinds.
         let flight = self.flight(key);
-        let _permit = flight.permit.lock().unwrap_or_else(|e| e.into_inner());
+        let _permit = flight.permit().lock().unwrap_or_else(|e| e.into_inner());
         if path.is_file() {
             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit after waiting");
             return Ok(path);
@@ -238,12 +251,45 @@ mod tests {
         let b = CacheKey::new(&conv, b"b");
         {
             let first = cache.flight(a);
-            let _held = first.permit.lock().unwrap();
+            let _held = first.permit().lock().unwrap();
             let same = cache.flight(a);
             let other = cache.flight(b);
-            assert!(same.permit.try_lock().is_err());
-            assert!(other.permit.try_lock().is_ok());
+            assert!(same.permit().try_lock().is_err());
+            assert!(other.permit().try_lock().is_ok());
         }
+        assert!(cache.flights.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_flight_retirement_does_not_retain_entries() {
+        use std::sync::Barrier;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        let keys: Vec<_> = (0u32..256)
+            .map(|n| CacheKey::new(&conv, &n.to_le_bytes()))
+            .collect();
+        let rendezvous = Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let cache = &cache;
+                let keys = &keys;
+                let rendezvous = &rendezvous;
+                scope.spawn(move || {
+                    for &key in keys {
+                        let flight = cache.flight(key);
+                        // All eight callers own a reference before any retire.
+                        rendezvous.wait();
+                        drop(flight);
+                        rendezvous.wait();
+                    }
+                });
+            }
+        });
         assert!(cache.flights.lock().unwrap().is_empty());
     }
 
