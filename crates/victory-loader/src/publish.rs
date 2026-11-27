@@ -6,7 +6,9 @@
 //! rename is atomic within the directory, and the staging file is removed
 //! if publication fails.
 
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_STAGING: AtomicU64 = AtomicU64::new(0);
@@ -17,21 +19,37 @@ pub fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
         return Ok(());
     }
+    let (staging, mut file) = create_staging(path, &NEXT_STAGING)?;
+    let written = file.write_all(bytes);
+    // Close the handle before rename or cleanup, including on Windows.
+    drop(file);
+    let result = written.and_then(|()| std::fs::rename(&staging, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+    result
+}
+
+/// Reserve a new file without truncating leftovers from a previous process
+/// that happened to have the same PID, or another writer's staging file.
+fn create_staging(path: &Path, next: &AtomicU64) -> std::io::Result<(PathBuf, File)> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("image");
-    let sequence = NEXT_STAGING.fetch_add(1, Ordering::Relaxed);
-    let staging = path.with_file_name(format!(
-        ".{name}.{}.{sequence}.tmp",
-        std::process::id()
-    ));
-    std::fs::write(&staging, bytes)?;
-    if let Err(error) = std::fs::rename(&staging, path) {
-        let _ = std::fs::remove_file(&staging);
-        return Err(error);
+    loop {
+        let sequence = next.fetch_add(1, Ordering::Relaxed);
+        let staging = path.with_file_name(format!(".{name}.{}.{sequence}.tmp", std::process::id()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)
+        {
+            Ok(file) => return Ok((staging, file)),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -60,6 +78,35 @@ mod tests {
             .filter(|entry| entry.path() != path)
             .collect();
         assert!(leftovers.is_empty(), "staging files were removed: {leftovers:?}");
+    }
+
+    #[test]
+    fn stale_staging_file_is_not_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.bin");
+        let stale = dir
+            .path()
+            .join(format!(".image.bin.{}.0.tmp", std::process::id()));
+        std::fs::write(&stale, b"previous writer").unwrap();
+        let next = AtomicU64::new(0);
+        let (staging, mut file) = create_staging(&path, &next).unwrap();
+        assert_ne!(staging, stale);
+        file.write_all(b"new writer").unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&stale).unwrap(), b"previous writer");
+        assert_eq!(std::fs::read(&staging).unwrap(), b"new writer");
+    }
+
+    #[test]
+    fn failed_rename_removes_created_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.bin");
+        // An existing nonempty directory cannot be replaced by a file.
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), b"untouched").unwrap();
+        assert!(write_if_changed(&path, b"bytes").is_err());
+        assert_eq!(std::fs::read(path.join("keep")).unwrap(), b"untouched");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
