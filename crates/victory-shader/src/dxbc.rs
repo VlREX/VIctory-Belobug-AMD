@@ -82,9 +82,16 @@ impl<'a> Container<'a> {
         if count > MAX_PARTS {
             return Err(ShaderError::Malformed("implausible part count"));
         }
+        let table_end = HEADER_SIZE + 4 * count;
+        if table_end > data.len() {
+            return Err(ShaderError::Malformed("truncated part offset table"));
+        }
         let mut parts = Vec::with_capacity(count);
         for i in 0..count {
             let offset = u32_at(data, HEADER_SIZE + 4 * i)? as usize;
+            if offset < table_end {
+                return Err(ShaderError::Malformed("part overlaps container metadata"));
+            }
             let fourcc = FourCC(
                 data.get(offset..offset + 4)
                     .ok_or(ShaderError::Malformed("part header out of bounds"))?
@@ -168,6 +175,37 @@ mod tests {
         assert_eq!(c.part(FourCC::SFI0).unwrap().data, &[1, 2, 3, 4]);
         assert_eq!(c.part(FourCC::HASH).unwrap().data.len(), 20);
         assert!(c.part(FourCC::DXIL).is_none());
+    }
+
+    #[test]
+    fn rejects_parts_pointing_into_container_metadata() {
+        // A zero-filled digest looks like a valid empty part to a parser
+        // that checks only whether the offset and size fit in the buffer.
+        let mut bytes = build(&[(FourCC::SFI0, &[])]);
+        bytes[0x20..0x24].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(
+            Container::parse(&bytes).unwrap_err(),
+            ShaderError::Malformed("part overlaps container metadata")
+        );
+
+        // The offset table itself can also be mistaken for a part header:
+        // the first offset becomes its tag, and the zero tag its size.
+        let mut bytes = build(&[(FourCC([0; 4]), &[])]);
+        bytes[0x20..0x24].copy_from_slice(&0x20u32.to_le_bytes());
+        assert_eq!(
+            Container::parse(&bytes).unwrap_err(),
+            ShaderError::Malformed("part overlaps container metadata")
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_part_offset_table() {
+        let mut bytes = build(&[]);
+        bytes[0x1C..0x20].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            Container::parse(&bytes).unwrap_err(),
+            ShaderError::Malformed("truncated part offset table")
+        );
     }
 
     #[test]
