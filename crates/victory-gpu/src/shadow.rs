@@ -1151,6 +1151,51 @@ mod snapshot_sweep_tests {
         pending.push((0, 22400));
         assert!(snapshot_parts((0, 22400), &pending, identity).is_empty());
     }
+    #[test]
+    fn benchmark_snapshot_sweep() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        for count in [32, 128, 1024, 2800] {
+            for fragmented in [false, true] {
+                let pending: Vec<_> = (0..count).rev().map(|i| {
+                    if fragmented { (i * 64 + 16, i * 64 + 32) }
+                    else { (i * 64, i * 64 + 96) }
+                }).collect();
+                let range = (0, count * 64 + 128);
+                assert_eq!(snapshot_parts(range, &pending, |r| r),
+                    snapshot_parts_pairwise(range, &pending, |r| r));
+                let measure = |new: bool| {
+                    let start = Instant::now();
+                    for _ in 0..8 {
+                        let parts = if new {
+                            snapshot_parts(black_box(range), black_box(&pending), |r| r)
+                        } else {
+                            snapshot_parts_pairwise(black_box(range), black_box(&pending), |r| r)
+                        };
+                        drop(black_box(parts));
+                    }
+                    start.elapsed().as_secs_f64() * 1e6 / 8.0
+                };
+                black_box(measure(false));
+                black_box(measure(true));
+                let (mut old, mut new) = (Vec::new(), Vec::new());
+                for i in 0..7 {
+                    let (a, b) = if i % 2 == 0 {
+                        (measure(false), measure(true))
+                    } else {
+                        let b = measure(true);
+                        (measure(false), b)
+                    };
+                    old.push(a);
+                    new.push(b);
+                }
+                old.sort_by(f64::total_cmp);
+                new.sort_by(f64::total_cmp);
+                eprintln!("SNAPSHOT_SWEEP_BENCH ranges={count} fragmented={fragmented}: old {:.3} us, new {:.3} us, {:.3}x", old[3], new[3], old[3] / new[3]);
+            }
+        }
+    }
+
 }
 
 #[cfg(test)]
